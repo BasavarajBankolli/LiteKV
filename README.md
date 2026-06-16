@@ -4,52 +4,208 @@ A persistent, embedded key-value store built in Go from first principles.
 
 Implements an LSM Tree (Log-Structured Merge-Tree) storage engine — the same architecture used by LevelDB, RocksDB, and Cassandra. Built to understand how production databases work under the hood.
 
+#### Dashboard
+![alt text](screenshots/dashboard.png)
+
+#### Explorer
+![alt text](screenshots/explorer.png)
+
 ---
 
 ## Architecture
 
+### Write Path
+
+```text
+                Put(key, value)
+                        │
+                        ▼
+            Write-Ahead Log (WAL)
+                 (Durability)
+                        │
+                        ▼
+            MemTable (Skip List)
+                        │
+                [Size >= 4 MB]
+                        │
+                        ▼
+              Flush to SSTable
+                        │
+                        ▼
+                 SSTable (L0)
+            (Immutable & Sorted)
+                        │
+                [L0 >= 4 files]
+                        │
+                        ▼
+                  Compaction
+                        │
+                        ▼
+                 L1 → L2 → L3
 ```
-              Write Path
-              ──────────
-  Put(k,v) → WAL (fsync) → MemTable (skip list)
-                                  │
-                           [full: 4MB]
-                                  ↓
-                          SSTable (L0) ← immutable, sorted
-                                  │
-                         [L0 ≥ 4 files]
-                                  ↓
-                          Compaction → L1, L2, ...
 
+### Read Path
 
-              Read Path
-              ─────────
-  Get(k) → MemTable → Immutable MemTable
-               → L0 SSTables (Bloom filter → index → disk)
-               → L1 SSTables ...
+```text
+                  Get(key)
+                      │
+                      ▼
+                  MemTable
+                      │
+               (not found)
+                      ▼
+            Immutable MemTable
+                      │
+               (not found)
+                      ▼
+             Bloom Filter Check
+                      │
+            ┌─────────┴─────────┐
+            │                   │
+          NO                    YES
+            │                   │
+            ▼                   ▼
+      Return Not Found     SSTable Lookup
+                                │
+                                ▼
+                         Sparse Index
+                                │
+                                ▼
+                           Data Block
 ```
-
-### Components
-
-**Write-Ahead Log (WAL)**
-Every write is durably appended to the WAL before touching memory. On a crash, the WAL is replayed on startup to rebuild the MemTable. Wire format: `[type:1B][txnID:8B][keyLen:4B][valLen:4B][key][val][crc32:4B]`. The CRC catches partial writes from mid-crash truncations.
-
-**MemTable**
-An in-memory sorted buffer backed by a skip list (O(log n) reads and writes). When it reaches 4 MB, it becomes immutable and is flushed to disk as an SSTable in a background goroutine while a fresh MemTable takes writes.
-
-**SSTable (Sorted String Table)**
-Immutable, sorted on-disk files. Layout: data blocks → sparse index → Bloom filter → footer. The footer stores byte offsets so the index and filter can be loaded at open time without scanning the whole file.
-
-**Bloom Filters**
-Each SSTable has a Bloom filter sized for 1% false-positive rate. Before doing any disk I/O, `Get` asks the filter: "might this key exist?" A definitive NO skips the disk read entirely. On a workload with many misses (common in practice), this eliminates the majority of disk seeks.
-
-**MVCC (Multi-Version Concurrency Control)**
-A logical clock assigns monotonically increasing versions to every write. Readers snapshot the current version and see a consistent view without taking locks — enabling concurrent reads with zero reader-writer contention.
-
-**Compaction**
-Background goroutine monitors L0. When L0 accumulates ≥ 4 SSTables, it merge-sorts them (k-way merge) into a single L1 file, dropping duplicate keys (keeping latest version) and tombstones at the bottom level. This bounds read amplification and reclaims disk space.
 
 ---
+
+## Core Components
+
+### Write-Ahead Log (WAL)
+
+Every write is first appended to the WAL before being stored in memory.
+
+**Purpose**
+- Crash recovery
+- Durability
+- Transaction replay
+
+**Record Format**
+
+```text
+[type][txnID][keyLen][valLen][key][value][crc32]
+```
+
+The CRC checksum helps detect corrupted or partially written records after crashes.
+
+---
+
+### MemTable
+
+The MemTable is an in-memory sorted data structure implemented using a Skip List.
+
+**Complexity**
+
+| Operation | Complexity |
+|------------|------------|
+| Insert | O(log n) |
+| Search | O(log n) |
+| Delete | O(log n) |
+
+When the MemTable reaches **4 MB**, it becomes immutable and is flushed to disk as an SSTable while a new MemTable continues accepting writes.
+
+---
+
+### SSTable (Sorted String Table)
+
+An SSTable is an immutable sorted file stored on disk.
+
+**Layout**
+
+```text
+Data Blocks
+     │
+     ▼
+Sparse Index
+     │
+     ▼
+Bloom Filter
+     │
+     ▼
+Footer
+```
+
+The footer stores offsets for quickly locating the index and Bloom filter without scanning the entire file.
+
+---
+
+### Bloom Filters
+
+Each SSTable contains a Bloom Filter configured for approximately **1% false-positive probability**.
+
+Before accessing disk:
+
+```text
+Does key exist?
+       │
+       ▼
+Bloom Filter
+       │
+ ┌─────┴─────┐
+ │           │
+NO          MAYBE
+ │           │
+ ▼           ▼
+Skip      Read SSTable
+Disk I/O
+```
+
+This significantly reduces unnecessary disk reads for missing keys.
+
+---
+
+### MVCC (Multi-Version Concurrency Control)
+
+Every write receives a monotonically increasing version number.
+
+Benefits:
+
+- Lock-free reads
+- Snapshot isolation
+- Concurrent readers
+- Consistent transactions
+
+Readers operate on a snapshot and never block writers.
+
+---
+
+### Compaction
+
+Compaction merges multiple SSTables into larger levels.
+
+```text
+Level 0
+
+sst_1
+sst_2
+sst_3
+sst_4
+
+      ▼
+
+Merge Sort
+
+      ▼
+
+Level 1
+
+sst_merged
+```
+
+During compaction:
+
+- Duplicate keys are removed
+- Older versions are discarded
+- Tombstones are cleaned up
+- Read amplification is reduced
+- Disk space is reclaimed
 
 ## Performance
 
@@ -84,7 +240,10 @@ cd litekv
 go mod tidy
 
 # Start the server
-go run ./cmd/server --dir ./data --rest :8080 --grpc :9090
+go run ./cmd/server --dir ./data --rest :8080 
+
+# To seed some data to DB use this cmd
+go run ./cmd/server --dir ./data --rest :8080 --seed
 
 # Run throughput benchmark
 go run ./cmd/server --bench
